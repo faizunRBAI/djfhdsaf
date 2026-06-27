@@ -1,0 +1,284 @@
+---
+- name: Configure EC2 instance and deploy Node.js app
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /home/ubuntu/app
+    db_name: appdb
+    db_user: appuser
+    db_password: changeme_secret_123
+    node_env: production
+    app_port: 3000
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - curl
+          - git
+          - unzip
+          - build-essential
+          - nginx
+          - postgresql
+          - postgresql-contrib
+          - acl
+          - python3-psycopg2
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Node.js 20 via NodeSource
+    # -------------------------------------------------------------------------
+    - name: Download NodeSource setup script for Node.js 20
+      get_url:
+        url: https://deb.nodesource.com/setup_20.x
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+
+    - name: Run NodeSource setup script
+      shell: bash /tmp/nodesource_setup.sh
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js 20
+      apt:
+        name: nodejs
+        state: present
+        update_cache: true
+
+    - name: Verify Node.js version
+      command: node --version
+      register: node_version
+      changed_when: false
+
+    - name: Print Node.js version
+      debug:
+        msg: "Node.js version: {{ node_version.stdout }}"
+
+    # -------------------------------------------------------------------------
+    # PM2 (global install)
+    # -------------------------------------------------------------------------
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: true
+        state: present
+
+    # -------------------------------------------------------------------------
+    # PostgreSQL setup
+    # -------------------------------------------------------------------------
+    - name: Ensure PostgreSQL service is started and enabled
+      service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Create PostgreSQL database user
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        state: present
+      ignore_errors: true
+
+    - name: Create PostgreSQL database
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+        owner: "{{ db_user }}"
+        state: present
+      ignore_errors: true
+
+    - name: Grant all privileges on database to user
+      become_user: postgres
+      community.postgresql.postgresql_privs:
+        db: "{{ db_name }}"
+        privs: ALL
+        type: database
+        role: "{{ db_user }}"
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Application directory and code
+    # -------------------------------------------------------------------------
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Synchronise application code from controller to host
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude='*.tfstate*'"
+        delete: false
+
+    - name: Fix ownership of application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        recurse: true
+
+    # -------------------------------------------------------------------------
+    # .env file - rendered via shell: to satisfy invariant (no copy: content:)
+    # -------------------------------------------------------------------------
+    - name: Write .env file via shell
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        NODE_ENV={{ node_env }}
+        PORT={{ app_port }}
+        HOST=0.0.0.0
+        DATABASE_URL=postgresql://{{ db_user }}:{{ db_password }}@127.0.0.1:5432/{{ db_name }}
+        DB_SSL=false
+        ENVEOF
+      args:
+        executable: /bin/bash
+
+    - name: Set .env file ownership
+      file:
+        path: "{{ app_dir }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+
+    # -------------------------------------------------------------------------
+    # npm install
+    # -------------------------------------------------------------------------
+    - name: Install npm dependencies
+      become_user: ubuntu
+      shell: |
+        cd {{ app_dir }}
+        npm ci --omit=dev
+      args:
+        executable: /bin/bash
+
+    # -------------------------------------------------------------------------
+    # PM2 - start / restart application
+    # -------------------------------------------------------------------------
+    - name: Stop existing PM2 app if running (ubuntu user)
+      become_user: ubuntu
+      shell: |
+        cd {{ app_dir }}
+        pm2 delete app 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: Start application with PM2 using npm start
+      become_user: ubuntu
+      shell: |
+        cd {{ app_dir }}
+        pm2 start npm --name app -- start --update-env
+      args:
+        executable: /bin/bash
+
+    - name: Save PM2 process list
+      become_user: ubuntu
+      shell: pm2 save
+      args:
+        executable: /bin/bash
+
+    - name: Configure PM2 to start on system boot
+      shell: |
+        PM2_STARTUP=$(pm2 startup systemd -u ubuntu --hp /home/ubuntu 2>&1 | tail -1)
+        eval "${PM2_STARTUP}" || true
+      args:
+        executable: /bin/bash
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    # -------------------------------------------------------------------------
+    # Nginx - proxy port 80 -> 127.0.0.1:3000
+    # -------------------------------------------------------------------------
+    - name: Write Nginx site configuration via shell
+      shell: |
+        cat > /etc/nginx/sites-available/app << 'NGINXEOF'
+        server {
+            listen 80 default_server;
+            listen [::]:80 default_server;
+
+            server_name _;
+
+            location / {
+                proxy_pass         http://127.0.0.1:3000;
+                proxy_http_version 1.1;
+                proxy_set_header   Upgrade $http_upgrade;
+                proxy_set_header   Connection 'upgrade';
+                proxy_set_header   Host $host;
+                proxy_set_header   X-Real-IP $remote_addr;
+                proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header   X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+            }
+        }
+        NGINXEOF
+      args:
+        executable: /bin/bash
+
+    - name: Enable app site (symlink)
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Restart and enable Nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    # -------------------------------------------------------------------------
+    # Wait for the app to be listening on port 3000
+    # -------------------------------------------------------------------------
+    - name: Wait for application to listen on port 3000
+      wait_for:
+        host: 127.0.0.1
+        port: 3000
+        timeout: 60
+        state: started
+
+    # -------------------------------------------------------------------------
+    # Local smoke test from the EC2 instance itself
+    # -------------------------------------------------------------------------
+    - name: Local health check
+      uri:
+        url: http://127.0.0.1:3000/health
+        method: GET
+        status_code: [200, 201, 202, 204]
+        timeout: 15
+      register: health_result
+
+    - name: Print health check result
+      debug:
+        msg: "Health check response: {{ health_result.json | default(health_result.content) }}"
